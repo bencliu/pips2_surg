@@ -5,3 +5,6 @@
 .DS_Store
 *.out
 *.gif
+logs_train/
+logs_demo/
+checkpoints/
