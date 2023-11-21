@@ -20,7 +20,7 @@ def save(ckpt_dir, optimizer, model, global_step, scheduler=None, keep_latest=5,
     torch.save(ckpt, model_path)
     print("saved a checkpoint: %s" % (model_path))
 
-def load(ckpt_dir, model, optimizer=None, scheduler=None, step=0, model_name='model', ignore_load=None):
+def load(ckpt_dir, model, optimizer=None, scheduler=None, step=0, model_name='model', ignore_load=None, surg_model=True):
     print('reading ckpt from %s' % ckpt_dir)
     if not os.path.exists(ckpt_dir):
         print('...there is no full checkpoint here!')
@@ -39,7 +39,7 @@ def load(ckpt_dir, model, optimizer=None, scheduler=None, step=0, model_name='mo
                 
                 print('ignoring', ignore_load)
 
-                checkpoint = torch.load(path)['model_state_dict']
+                checkpoint = torch.load(path)['model_state_dict'] 
 
                 model_dict = model.state_dict()
 
@@ -47,6 +47,11 @@ def load(ckpt_dir, model, optimizer=None, scheduler=None, step=0, model_name='mo
                 pretrained_dict = {k: v for k, v in checkpoint.items()}
                 for ign in ignore_load:
                     pretrained_dict = {k: v for k, v in pretrained_dict.items() if not ign in k}
+
+                # Modify weights for surg_model 
+                custom_in_channels = model_dict["delta_block.first_block_conv.conv.weight"].shape[1]
+                if surg_model:
+                    checkpoint["delta_block.first_block_conv.conv.weight"] = checkpoint["delta_block.first_block_conv.conv.weight"][:, :custom_in_channels, :] 
                     
                 # 2. overwrite entries in the existing state dict
                 model_dict.update(pretrained_dict)

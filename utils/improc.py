@@ -460,7 +460,7 @@ def get_n_colors(N, sequential=False):
     return label_colors
 
 class Summ_writer(object):
-    def __init__(self, writer, global_step, log_freq=10, fps=8, scalar_freq=100, just_gif=False):
+    def __init__(self, writer, global_step, log_freq=10, fps=4, scalar_freq=100, just_gif=False, val=False):
         self.writer = writer
         self.global_step = global_step
         self.log_freq = log_freq

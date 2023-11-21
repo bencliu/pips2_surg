@@ -105,6 +105,7 @@ def main(
         log_freq=100,
         device_ids=[0],
 ):
+    print("Starting dataset export sciprt") 
     device = 'cpu:%d' % device_ids[0]
 
     # the idea in this file is:
@@ -176,7 +177,7 @@ def main(
             just_gif=True)
 
         H, W = crop_size
-        out_dir = './pod_export/%s_%d_%d_%dx%d' % (mod, S, N, H, W)
+        out_dir = './pod_export_full/%s_%d_%d_%dx%d' % (mod, S, N, H, W)
         exp_out_dir = '%s/%06d' % (out_dir, this_step)
 
         npz_out_f = '%s/track.npz' % (exp_out_dir)

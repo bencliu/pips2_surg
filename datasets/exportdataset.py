@@ -49,9 +49,10 @@ class ExportDataset(torch.utils.data.Dataset):
                  dataset_location='./pod_export',
                  dataset_version='aa',
                  S=36,
-                 N=128,
+                 N=21, #15
                  crop_size=(384,512), 
                  use_augs=False,
+                 sample=None,
     ):
         print('loading export...')
 
@@ -62,7 +63,10 @@ class ExportDataset(torch.utils.data.Dataset):
         self.crop_size = crop_size
         self.use_augs = use_augs
         
-        self.dataset_location = Path('%s/%s' % (self.dataset_location, dataset_version))
+        if "pod_export" in dataset_location:
+            self.dataset_location = Path('%s/%s' % (self.dataset_location, dataset_version))
+        else:
+            self.dataset_location = Path(dataset_location)
 
         folder_names = self.dataset_location.glob('*/')
         folder_names = [fn for fn in folder_names]
@@ -72,12 +76,20 @@ class ExportDataset(torch.utils.data.Dataset):
         self.all_folder_names = []
         rgbs = read_mp4(str(folder_names[0] / 'rgb.mp4'))
         rgbs = np.stack(rgbs, axis=0) # S,H,W,3
-        S_local,H,W,C = rgbs.shape
+        S_local,H,W,C = rgbs.shape 
+        if not H==self.H or not W==self.W:
+            start_H = (H - self.H) // 2
+            start_W = (W - self.W) // 2
+            rgbs = rgbs[:, start_H:start_H+self.H, start_W:start_W+self.W, :]
+            S_local,H,W,C = rgbs.shape 
         assert(H==self.H)
         assert(W==self.W)
         assert(S_local==self.S)
         
-        self.all_folder_names = folder_names
+        if sample is not None:
+            self.all_folder_names = self.filter_image_folders(folder_names[:sample])
+        else:
+            self.all_folder_names = self.filter_image_folders(folder_names)
 
         self.color_augmenter = A.ReplayCompose([
             A.GaussNoise(p=0.2),
@@ -98,11 +110,21 @@ class ExportDataset(torch.utils.data.Dataset):
             A.HueSaturationValue(p=0.3),
             A.ImageCompression(quality_lower=50, quality_upper=100, p=0.3),
         ], p=0.8)
+
+    #Get rid of videos that are too short 
+    def filter_image_folders(self, folder_names): 
+        new_folder_names = [] 
+        for folder_name in folder_names:
+            rgbs = read_mp4(str(folder_name / 'rgb.mp4'))
+            d = dict(np.load(folder_name / 'track.npz', allow_pickle=True))
+            track = d['track_g']
+            if len(rgbs) == len(track):
+                new_folder_names.append(folder_name) 
+        return new_folder_names
         
     
     def __getitem__(self, index):
         folder = self.all_folder_names[index]
-        # print('folder', folder)
         
         rgbs = read_mp4(str(folder / 'rgb.mp4'))
 
@@ -110,16 +132,21 @@ class ExportDataset(torch.utils.data.Dataset):
             print('corrupted mp4 in %s; returning fake' % folder)
             fake_sample = {
                 'rgbs': np.zeros((self.S,3,self.H,self.W), dtype=np.uint8), 
-                'track_g': np.zeros((self.S,self.N,4), dtype=np.float32)
+                'track_g': np.zeros((self.S,self.N,4), dtype=np.float32) #Seq_len, number of keypoints, annotations per frame 
             }
             return fake_sample
         rgbs = np.stack(rgbs, axis=0) # S,H,W,3
 
         d = dict(np.load(folder / 'track.npz', allow_pickle=True))
-        track = d['track_g']
+        try:
+            track = d['track_g']
+        except Exception as e:
+            print(d.keys())
+            print(d)
+            print(folder) 
 
         H,W,C = rgbs[0].shape
-        S,N,D = track.shape
+        S,N,D = track.shape #(30 seq_len, 21 keypoints, 4 [xy-vis-valid])
 
         assert(N >= self.N)
         assert(H==self.H)

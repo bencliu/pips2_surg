@@ -19,7 +19,14 @@ from torch import nn, einsum
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange, Reduce
 from torch.utils.data import Dataset, DataLoader
-
+import glob 
+import os 
+import json 
+from pathlib import Path
+import cv2 
+import matplotlib.pyplot as plt
+from helper import * 
+    
 def create_pools(n_pool=1000):
     pools = {}
     pool_names = [
@@ -38,7 +45,11 @@ def create_pools(n_pool=1000):
         'survival',
         'total_loss',
     ]
+    new_pool_names = [] 
     for pool_name in pool_names:
+        new_pool_names.append("train_" + pool_name) 
+        new_pool_names.append("val_" + pool_name)
+    for pool_name in new_pool_names:
         pools[pool_name] = utils.misc.SimplePool(n_pool, version='np')
     return pools
 
@@ -49,27 +60,24 @@ def requires_grad(parameters, flag=True):
 def fetch_optimizer(lr, wdecay, epsilon, num_steps, params):
     optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=wdecay, eps=epsilon)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, lr, num_steps+100, pct_start=0.1, cycle_momentum=False, anneal_strategy='linear')
+        optimizer, lr, num_steps+100, pct_start=0.1, cycle_momentum=False, anneal_strategy='linear') #Bug area => Change to 1000
     return optimizer, scheduler
 
-def val_model(model, d, device, iters=8, sw=None, is_train=False):
+def val_model(model, d, device, iters=8, sw=None, is_train=False): 
     metrics = {}
 
     rgbs = d['rgbs'].float().to(device) # B,S,C,H,W
     track_g = d['track_g'].float().to(device) # B,S,N,8
-    trajs_g = track_g[:,:,:,:2]
-    vis_g = track_g[:,:,:,2]
-    valids = track_g[:,:,:,3]
+    trajs_g = track_g[:,:,:,:2] #All trajectory points 
+    vis_g = track_g[:,:,:,2] #Visibility only 
+    valids = track_g[:,:,:,3] #Validity status
 
     B, S, C, H, W = rgbs.shape
     B, S, N, D = trajs_g.shape
     assert(D==2)
 
-    # zero-vel init
-    trajs_e0 = trajs_g[:,0:1].repeat(1,S,1,1)
-
-    preds, preds_anim, _, _ = model(trajs_e0, rgbs, iters=iters)
-    trajs_e = preds[-1]
+    preds, preds_anim, _, _ = model(rgbs, iters=iters) 
+    trajs_e = preds[-1] #Predictions
 
     l1_dists = torch.abs(trajs_e - trajs_g).sum(dim=-1) # B,S,N
     l1_loss = utils.basic.reduce_masked_mean(l1_dists, valids)
@@ -85,17 +93,22 @@ def val_model(model, d, device, iters=8, sw=None, is_train=False):
     metrics['ate_all'] = ate_all.mean().item()
     metrics['ate_vis'] = ate_vis.item()
     metrics['ate_occ'] = ate_occ.item()
-    
-    if sw is not None and sw.save_this:
+
+    if sw is not None and sw.save_this: #Logging scheme for validation 
         prep_rgbs = utils.improc.preprocess_color(rgbs)
         prep_grays = torch.mean(prep_rgbs, dim=2, keepdim=True).repeat(1, 1, 3, 1, 1)
+
+        rgb0 = sw.summ_traj2ds_on_rgb('', trajs_g[0:1], prep_rgbs[0:1,0], valids=valids[0:1], cmap='winter', linewidth=2, only_return=True)
+        sw.summ_traj2ds_on_rgb('2_outputs_val/trajs_e_on_rgb0', trajs_e[0:1], utils.improc.preprocess_color(rgb0), valids=valids[0:1], cmap='spring', linewidth=2, frame_id=ate_all[0].mean().item())
+        sw.summ_traj2ds_on_rgbs2('0_inputs_val/trajs_g_on_rgbs2', trajs_g[0:1,::4], vis_g[0:1,::4], prep_rgbs[0:1,::4], valids=valids[0:1,::4], frame_ids=list(range(0,S,4)))
+
         gt_rgb = utils.improc.preprocess_color(sw.summ_traj2ds_on_rgb('', trajs_g[0:1], prep_grays[0:1].mean(dim=1), valids=valids[0:1], cmap='winter', only_return=True))
         rgb_vis = []
         for tre in preds_anim:
             ate = torch.norm(tre - trajs_g, dim=-1) # B,S,N
             ate_all = utils.basic.reduce_masked_mean(ate, valids, dim=[1,2]) # B
             rgb_vis.append(sw.summ_traj2ds_on_rgb('', tre[0:1], gt_rgb, valids=valids[0:1], only_return=True, cmap='spring', frame_id=ate_all[0]))
-        sw.summ_rgbs('3_test/animated_trajs_on_rgb', rgb_vis)
+        sw.summ_rgbs('3_val/animated_trajs_on_rgb', rgb_vis)
         
     d_sum = 0.0
     thrs = [1,2,4,8,16]
@@ -103,7 +116,7 @@ def val_model(model, d, device, iters=8, sw=None, is_train=False):
     sy_ = H / 256.0
     sc_py = np.array([sx_, sy_]).reshape([1,1,2])
     sc_pt = torch.from_numpy(sc_py).float().cuda()
-    for thr in thrs:
+    for thr in thrs: 
         # note we exclude timestep0 from this eval
         d_ = (torch.norm(trajs_e[:,1:]/sc_pt - trajs_g[:,1:]/sc_pt, dim=-1) < thr).float() # B,S-1,N
         d_ = utils.basic.reduce_masked_mean(d_, valids[:,1:]).item()*100.0
@@ -123,6 +136,7 @@ def val_model(model, d, device, iters=8, sw=None, is_train=False):
     valids_ = valids.permute(0,2,1).reshape(B*N,S)
     median_l2 = utils.basic.reduce_masked_median(dists_, valids_, keep_batch=True) # B*N
     metrics['median_l2'] = median_l2.mean().item()
+    metrics = {'val_' + key: value for key, value in metrics.items()}
 
     return metrics
 
@@ -132,7 +146,7 @@ def run_model(model, d, device, iters=8, sw=None, is_train=True, use_augs=True):
     metrics = {}
 
     rgbs = d['rgbs'].float().to(device) # B,S,C,H,W
-    track_g = d['track_g'].float().to(device) # B,S,N,8
+    track_g = d['track_g'].float().to(device) # B,S,N,8 
     trajs_g = track_g[:,:,:,:2]
     vis_g = track_g[:,:,:,2]
     valids = track_g[:,:,:,3]
@@ -145,27 +159,9 @@ def run_model(model, d, device, iters=8, sw=None, is_train=True, use_augs=True):
     assert(C==3)
     B, S, N, D = trajs_g.shape
     assert(D==2)
-
-    # full random
-    x = torch.from_numpy(np.random.uniform(0, W-1, (B,S,N))).float().to(trajs_g.device)
-    y = torch.from_numpy(np.random.uniform(0, H-1, (B,S,N))).float().to(trajs_g.device)
-    trajs_e0 = torch.stack([x,y], dim=-1) # B,S,N,2
-    # mix with gt a random amount
-    coeff = torch.from_numpy(np.random.uniform(0, 1, (B,1,N,1))).float().to(trajs_g.device)
-    trajs_e0 = trajs_e0*coeff + trajs_g*(1-coeff)
-    # use zero-velocity init for some
-    trajs_z = trajs_g[:,0:1].repeat(1,S,1,1)
-    mask = (torch.from_numpy(np.random.uniform(0, 1, (B,1,N,1))).float().to(trajs_g.device)>0.5).float()
-    trajs_e0 = trajs_e0*mask + trajs_z*(1-mask)
-    # reset zeroth on all
-    trajs_e0[:,0:1] = trajs_g[:,0:1]
-
-    # measure our initial distance, so we can check our improvement
-    ate0 = torch.norm(trajs_e0 - trajs_g, dim=-1) # B,S,N
-    ate0_all = utils.basic.reduce_masked_mean(ate0, valids, dim=[1,2])
     
-    preds, preds_anim, _, loss = model(trajs_e0, rgbs, iters=iters, trajs_g=trajs_g, vis_g=vis_g, valids=valids)
-    trajs_e = preds[-1]
+    preds, preds_anim, _, loss = model(rgbs, iters=iters, trajs_g=trajs_g, vis_g=vis_g, valids=valids)
+    trajs_e = preds[-1] #NOTE: Everything with trajs_e from this point on refers to pred 
 
     total_loss += loss
 
@@ -190,7 +186,7 @@ def run_model(model, d, device, iters=8, sw=None, is_train=True, use_augs=True):
     sy_ = H / 256.0
     sc_py = np.array([sx_, sy_]).reshape([1,1,2])
     sc_pt = torch.from_numpy(sc_py).float().to(device)
-    for thr in thrs:
+    for thr in thrs: #Various thresholds 
         # note we exclude timestep0 from this eval
         d_ = (torch.norm(trajs_e[:,1:]/sc_pt - trajs_g[:,1:]/sc_pt, dim=-1) < thr).float() # B,S-1,N
         d_ = utils.basic.reduce_masked_mean(d_, valids[:,1:]).item()*100.0
@@ -219,9 +215,8 @@ def run_model(model, d, device, iters=8, sw=None, is_train=True, use_augs=True):
         prep_grays = torch.mean(prep_rgbs, dim=2, keepdim=True).repeat(1, 1, 3, 1, 1)
 
         rgb0 = sw.summ_traj2ds_on_rgb('', trajs_g[0:1], prep_rgbs[0:1,0], valids=valids[0:1], cmap='winter', linewidth=2, only_return=True)
-        sw.summ_traj2ds_on_rgb('0_inputs/trajs_e0_on_rgb0', trajs_e0[0:1], utils.improc.preprocess_color(rgb0), valids=valids[0:1], cmap='spring', linewidth=2, frame_id=ate0_all[0].mean().item())
-        sw.summ_traj2ds_on_rgb('2_outputs/trajs_e_on_rgb0', trajs_e[0:1], utils.improc.preprocess_color(rgb0), valids=valids[0:1], cmap='spring', linewidth=2, frame_id=ate_all[0].mean().item())
-        sw.summ_traj2ds_on_rgbs2('0_inputs/trajs_g_on_rgbs2', trajs_g[0:1,::4], vis_g[0:1,::4], prep_rgbs[0:1,::4], valids=valids[0:1,::4], frame_ids=list(range(0,S,4)))
+        sw.summ_traj2ds_on_rgb('2_outputs_train/trajs_e_on_rgb0', trajs_e[0:1], utils.improc.preprocess_color(rgb0), valids=valids[0:1], cmap='spring', linewidth=2, frame_id=ate_all[0].mean().item())
+        sw.summ_traj2ds_on_rgbs2('0_inputs_train/trajs_g_on_rgbs2', trajs_g[0:1,::4], vis_g[0:1,::4], prep_rgbs[0:1,::4], valids=valids[0:1,::4], frame_ids=list(range(0,S,4)))
         
         # in the kp vis, clamp so that we can see everything
         trajs_g_clamp = trajs_g.clone()
@@ -237,7 +232,7 @@ def run_model(model, d, device, iters=8, sw=None, is_train=True, use_augs=True):
             ate = torch.norm(tre - trajs_g, dim=-1) # B,S,N
             ate_all = utils.basic.reduce_masked_mean(ate, valids, dim=[1,2]) # B
             rgb_vis.append(sw.summ_traj2ds_on_rgb('', tre[0:1], gt_rgb, valids=valids[0:1], only_return=True, cmap='spring', frame_id=ate_all[0]))
-        sw.summ_rgbs('3_test/animated_trajs_on_rgb', rgb_vis)
+        sw.summ_rgbs('3_train/animated_trajs_on_rgb', rgb_vis)
 
         outs = sw.summ_pts_on_rgbs(
             '',
@@ -246,10 +241,10 @@ def run_model(model, d, device, iters=8, sw=None, is_train=True, use_augs=True):
             valids=valids[0:1,::4],
             cmap='winter', linewidth=3, only_return=True)
         sw.summ_pts_on_rgbs(
-            '0_inputs/kps_gv_on_rgbs',
+            '0_inputs_train/kps_gv_on_rgbs',
             trajs_g_clamp[0:1,::4],
             utils.improc.preprocess_color(outs),
-            valids=valids[0:1,::4]*vis_g[0:1,::4],
+            valids=valids[0:1,::4]*vis_g[0:1,::4], 
             cmap='spring', linewidth=2)
 
         outs = sw.summ_pts_on_rgbs(
@@ -259,18 +254,18 @@ def run_model(model, d, device, iters=8, sw=None, is_train=True, use_augs=True):
             valids=valids[0:1,::4],
             cmap='winter', linewidth=3, only_return=True)
         sw.summ_pts_on_rgbs(
-            '2_outputs/kps_eg_on_rgbs',
+            '2_outputs_train/kps_eg_on_rgbs',
             trajs_e_clamp[0:1,::4],
             utils.improc.preprocess_color(outs),
             valids=valids[0:1,::4],
             cmap='spring', linewidth=2)
+    metrics = {'train_' + key: value for key, value in metrics.items()}
         
     return total_loss, metrics
-    
 
 def main(
         B=2, # batchsize 
-        S=36, # seqlen
+        S=30, # seqlen 
         N=64, # number of points per clip
         stride=8, # spatial stride of the model 
         iters=6, # inference steps of the model
@@ -279,28 +274,31 @@ def main(
         shuffle=True, # dataset shuffling
         cache_len=0, # how many samples to cache into ram (for overfitting/debug)
         cache_freq=0, # how often to add a new sample to cache
-        dataset_location='./pod_export', # where we exported the data
+        dataset_location="/pasteur/u/bencliu/open_surg/data/surgical_hands_release/train_dataset3", # where we export the dataset
         dataset_version='ae_36_128_384x512', # export version
         n_pool=1000, # size of running avg for stats
         quick=False, # debug
+        debug_train=True, # debug train_kpts 
         # optimization
-        lr=5e-4,
+        lr=5e-4, #Training raw weights is 5e-4 => reduced for finetuning 
         grad_acc=1, 
         use_scheduler=True,
-        max_iters=200000,
+        max_iters=201000, 
         # summaries
         log_dir='./logs_train',
         log_freq=1000,
-        val_freq=100,
+        val_freq=100, #100
         # saving/loading
         ckpt_dir='./checkpoints',
         save_freq=1000,
         keep_latest=2,
-        init_dir='',
-        load_optimizer=True,
-        load_step=True,
-        ignore_load=None,
+        init_dir='reference_model', #Load in reference model 
+        load_optimizer=False, #Changed to false to create new param
+        load_step=False,
+        ignore_load="Test",
         device_ids=[0],
+        exp_name="debug_surg_f1_minor_freeze", 
+        finetune_f1=True, 
 ):
     device = 'cuda:%d' % device_ids[0]
 
@@ -308,21 +306,30 @@ def main(
     # train from scratch on pointodyssey.
     # on val steps, unroll the inference.
 
-    exp_name = 'aa00' # copy from dev repo
-    exp_name = 'aa01' # clean up
-
     if quick: # (debug)
         B = 1
         log_freq = 100
         max_iters = 1000
         shuffle = False
+        val_freq = 2
+        n_pool = 100
+        use_augs = False
+        cache_len = 0 # overfit on this many
+        cache_freq = 0
+        save_freq = 99999999 
+    
+    if debug_train: # (debug)
+        B = 1
+        log_freq = 1
+        max_iters = 1000
+        shuffle = False 
         val_freq = 10
         n_pool = 100
         use_augs = False
         cache_len = 0 # overfit on this many
         cache_freq = 0
-        save_freq = 99999999
-        
+        save_freq = 99999999 
+    
     if init_dir:
         init_dir = '%s/%s' % (ckpt_dir, init_dir)
         
@@ -348,11 +355,12 @@ def main(
     model_date = datetime.datetime.now().strftime('%H%M%S')
     model_name = model_name + '_' + model_date
     print('model_name', model_name)
+    print('tensorboard command: ', "pips2 /pasteur/u/bencliu/miniconda3/envs/pips2/lib/python3.8/site-packages/tensorboard/main.py --logdir " + log_dir + '/' + model_name + " --bind_all") 
     
     ckpt_path = '%s/%s' % (ckpt_dir, model_name)
-    writer_t = SummaryWriter(log_dir + '/' + model_name + '/t', max_queue=10, flush_secs=60)
+    writer_t = SummaryWriter(log_dir + '/' + model_name + "/train", max_queue=1, flush_secs=20)
     if val_freq:
-        writer_v = SummaryWriter(log_dir + '/' + model_name + '/v', max_queue=10, flush_secs=60)
+        writer_v = SummaryWriter(log_dir + '/' + model_name + "/val", max_queue=1, flush_secs=20)
 
     def worker_init_fn(worker_id):
         np.random.seed(np.random.get_state()[1][0] + worker_id)
@@ -361,20 +369,23 @@ def main(
         dataset_version=dataset_version,
         S=S,
         crop_size=crop_size,
-        use_augs=use_augs)
+        use_augs=use_augs,
+        sample=1) #TODO change sampling 
+
     dataloader_t = DataLoader(
         dataset_t,
         batch_size=B,
         shuffle=shuffle,
-        num_workers=6,
+        num_workers=2,
         worker_init_fn=worker_init_fn,
         drop_last=True)
+    
     iterloader_t = iter(dataloader_t)
 
     if cache_len:
         sample_pool_t = utils.misc.SimplePool(cache_len, version='np')
     
-    model = Pips(stride=stride).to(device)
+    model = Pips(stride=stride, learn_kpts=finetune_f1).to(device)
     model = torch.nn.DataParallel(model, device_ids=device_ids)
 
     parameters = list(model.parameters())
@@ -396,9 +407,20 @@ def main(
         else:
             _ = saverloader.load(init_dir, model.module, ignore_load=ignore_load)
             global_step = 0
+
+    print("Finished loading model") 
     
-    requires_grad(parameters, True)
-    model.train()
+    #requires_grad(parameters, True) 
+    if finetune_f1:
+        for name, param in model.named_parameters():
+            if "kptFeat" in name:
+                print("Maintained unfrozen param: ", name) 
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+    else:
+        requires_grad(parameters, True) 
+    model.train() 
 
     pools_t = create_pools(n_pool)
     if val_freq:
@@ -406,78 +428,80 @@ def main(
     
     while global_step < max_iters:
         global_step += 1
+        print("Global step: ", global_step) 
         iter_start_time = time.time()
         iter_rtime = 0.0
-        
-        for internal_step in range(grad_acc):
-            read_start_time = time.time()
+        if not (global_step % val_freq == 0):
+            print("Performing training") 
+            for internal_step in range(grad_acc):
+                read_start_time = time.time()
 
-            if internal_step==grad_acc-1:
-                sw_t = utils.improc.Summ_writer(
-                    writer=writer_t,
-                    global_step=global_step,
-                    log_freq=log_freq,
-                    fps=min(S,8),
-                    scalar_freq=log_freq//4,
-                    just_gif=True)
-            else:
-                sw_t = None
+                if internal_step==grad_acc-1:
+                    sw_t = utils.improc.Summ_writer(
+                        writer=writer_t,
+                        global_step=global_step,
+                        log_freq=log_freq,
+                        fps=min(S,30),
+                        scalar_freq=log_freq//1,
+                        just_gif=True)
+                else:
+                    sw_t = None
 
-            read_new = True # read something from the dataloder
-            if cache_len: 
-                read_new = False
-                if len(sample_pool_t) < cache_len:
-                    read_new = True
-                if cache_freq > 0 and global_step % cache_freq == 0:
-                    read_new = True
-            if read_new:
-                try:
-                    sample = next(iterloader_t)
-                except StopIteration:
-                    iterloader_t = iter(dataloader_t)
-                    sample = next(iterloader_t)
+                read_new = True # read something from the dataloder
+                if cache_len: 
+                    read_new = False
+                    if len(sample_pool_t) < cache_len:
+                        read_new = True
+                    if cache_freq > 0 and global_step % cache_freq == 0:
+                        read_new = True
+                if read_new:
+                    try:
+                        sample = next(iterloader_t)
+                    except StopIteration:
+                        iterloader_t = iter(dataloader_t)
+                        sample = next(iterloader_t)
+                    if cache_len:
+                        sample_pool_t.update([sample])
+                        print('cached a new sample into sample_pool (len %d)' % (len(sample_pool_t)))
                 if cache_len:
-                    sample_pool_t.update([sample])
-                    print('cached a new sample into sample_pool (len %d)' % (len(sample_pool_t)))
-            if cache_len:
-                sample = sample_pool_t.sample()
-                    
-            iter_rtime += time.time()-read_start_time
+                    sample = sample_pool_t.sample()
+                        
+                iter_rtime += time.time()-read_start_time
 
-            total_loss, metrics = run_model(
-                model, sample, device,
-                iters=iters,
-                sw=sw_t,
-                is_train=True,
-                use_augs=use_augs)
+                total_loss, metrics = run_model(
+                    model, sample, device,
+                    iters=iters,
+                    sw=sw_t,
+                    is_train=True,
+                    use_augs=use_augs)
 
-            if torch.isnan(total_loss):
-                print('nan in loss; quitting')
-                return False
+                if torch.isnan(total_loss):
+                    print('nan in loss; quitting')
+                    return False
 
-            total_loss /= grad_acc
-            total_loss.backward()
+                total_loss /= grad_acc
+                total_loss.backward()
+            sw_t.summ_scalar('total_loss', metrics['train_total_loss'])
 
-        sw_t.summ_scalar('total_loss', metrics['total_loss'])
+            #HERE logging 
+            for key in list(pools_t.keys()):
+                if key in metrics:
+                    pools_t[key].update([metrics[key]])
+                sw_t.summ_scalar('_/%s' % (key), pools_t[key].mean())
 
-        for key in list(pools_t.keys()):
-            if key in metrics:
-                pools_t[key].update([metrics[key]])
-            sw_t.summ_scalar('_/%s' % (key), pools_t[key].mean())
+            current_lr = optimizer.param_groups[0]['lr']
+            sw_t.summ_scalar('_/current_lr', current_lr)
+            
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            optimizer.step()
+            if use_scheduler:
+                scheduler.step()
+            optimizer.zero_grad()
 
-        current_lr = optimizer.param_groups[0]['lr']
-        sw_t.summ_scalar('_/current_lr', current_lr)
-        
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-        optimizer.step()
-        if use_scheduler:
-            scheduler.step()
-        optimizer.zero_grad()
-
-        if np.mod(global_step, save_freq)==0:
-            saverloader.save(ckpt_path, optimizer, model.module, global_step, scheduler=scheduler, keep_latest=keep_latest)
-
-        if val_freq and (global_step) % val_freq == 0:
+            if np.mod(global_step, save_freq)==0:
+                saverloader.save(ckpt_path, optimizer, model.module, global_step, scheduler=scheduler, keep_latest=keep_latest)
+        else:
+            print("Performing validation") 
             model.eval()
             del sample
             with torch.no_grad():
@@ -486,9 +510,10 @@ def main(
                 writer=writer_v,
                 global_step=global_step,
                 log_freq=log_freq,
-                fps=min(S,8),
-                scalar_freq=log_freq//4,
-                just_gif=True)
+                fps=min(S,30), #(S, 8)
+                scalar_freq=log_freq//1, #4
+                just_gif=True,
+                val=True)
             if cache_len:
                 sample = sample_pool_t.sample()
             else:
@@ -503,6 +528,7 @@ def main(
                     iters=iters*2,
                     sw=sw_v,
                     is_train=False)
+
             for key in list(pools_v.keys()):
                 if key in metrics:
                     pools_v[key].update([metrics[key]])
@@ -512,14 +538,14 @@ def main(
                     
         iter_itime = time.time()-iter_start_time
 
-        if val_freq:
-            print('%s; step %06d/%d; rtime %.2f; itime %.2f; loss %.3f; loss_t %.2f; d_t %.1f; d_v %.1f' % (
+        if val_freq and (global_step) % val_freq == 0:
+            print('%s; step %06d/%d; rtime %.2f; itime %.2f; loss %.3f; d_v %.1f' % (
                 model_name, global_step, max_iters, iter_rtime, iter_itime,
-                total_loss.item(), pools_t['total_loss'].mean(), pools_t['d_avg'].mean(), pools_v['d_avg'].mean()))
+                total_loss.item(), pools_v['val_d_avg'].mean()))
         else:
             print('%s; step %06d/%d; rtime %.2f; itime %.2f; loss %.3f; loss_t %.2f; d_t %.1f' % (
                 model_name, global_step, max_iters, iter_rtime, iter_itime,
-                total_loss.item(), pools_t['total_loss'].mean(), pools_t['d_avg'].mean()))
+                total_loss.item(), pools_t['train_total_loss'].mean(), pools_t['train_d_avg'].mean()))
             
     writer_t.close()
     if val_freq:

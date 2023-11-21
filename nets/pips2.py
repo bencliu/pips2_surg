@@ -117,7 +117,10 @@ def sequence_loss(flow_preds, flow_gt, vis, valids, gamma=0.8):
     for i in range(n_predictions):
         i_weight = gamma**(n_predictions - i - 1)
         flow_pred = flow_preds[i]
-        i_loss = (flow_pred - flow_gt).abs() # B,S,N,2
+        try:
+            i_loss = (flow_pred - flow_gt).abs() # B,S,N,2
+        except:
+            breakpoint() #Ghost bug at global_step=42  
         i_loss = torch.mean(i_loss, dim=3) # B,S,N
         flow_loss += i_weight * utils.basic.reduce_masked_mean(i_loss, valids)
     flow_loss = flow_loss/n_predictions
@@ -199,6 +202,7 @@ class BasicEncoder(nn.Module):
             self.norm1 = nn.Sequential()
             
         self.conv1 = nn.Conv2d(input_dim, self.in_planes, kernel_size=7, stride=2, padding=3, padding_mode='zeros')
+        print("Conv1: ", input_dim, self.in_planes)
         self.relu1 = nn.ReLU(inplace=True)
 
         self.layer1 = self._make_layer(64,  stride=1)
@@ -234,7 +238,7 @@ class BasicEncoder(nn.Module):
     def forward(self, x):
 
         _, _, H, W = x.shape
-        
+
         x = self.conv1(x)
         x = self.norm1(x)
         x = self.relu1(x)
@@ -243,10 +247,12 @@ class BasicEncoder(nn.Module):
         b = self.layer2(a)
         c = self.layer3(b)
         d = self.layer4(c)
+
         a = F.interpolate(a, (H//self.stride, W//self.stride), mode='bilinear', align_corners=True)
         b = F.interpolate(b, (H//self.stride, W//self.stride), mode='bilinear', align_corners=True)
         c = F.interpolate(c, (H//self.stride, W//self.stride), mode='bilinear', align_corners=True)
         d = F.interpolate(d, (H//self.stride, W//self.stride), mode='bilinear', align_corners=True)
+
         x = self.conv2(torch.cat([a,b,c,d], dim=1))
         x = self.norm2(x)
         x = self.relu2(x)
@@ -260,12 +266,12 @@ class DeltaBlock(nn.Module):
     def __init__(self, latent_dim=128, hidden_dim=128, corr_levels=4, corr_radius=3):
         super(DeltaBlock, self).__init__()
         
-        kitchen_dim = (corr_levels * (2*corr_radius + 1)**2)*3 + latent_dim + 2
+        kitchen_dim = (corr_levels * (2*corr_radius + 1)**2) + latent_dim + 2 #(corr_levels * (2*corr_radius + 1)**2)*3 + latent_dim + 2  -- Notice *3 in parameter 
 
         self.latent_dim = latent_dim
         self.hidden_dim = hidden_dim
         
-        in_channels = kitchen_dim
+        in_channels = kitchen_dim #Currently registered at 326 
         base_filters = 128
         self.n_block = 8
         self.kernel_size = 3
@@ -275,6 +281,7 @@ class DeltaBlock(nn.Module):
 
         self.increasefilter_gap = 2 
 
+        print("Number of in_channels: ", in_channels, "\n\n\n\n")
         self.first_block_conv = Conv1dPad(in_channels=in_channels, out_channels=base_filters, kernel_size=self.kernel_size, stride=1)
         self.first_block_norm = nn.InstanceNorm1d(base_filters)
         self.first_block_relu = nn.ReLU()
@@ -316,13 +323,13 @@ class DeltaBlock(nn.Module):
             
     def forward(self, fcorr, flow):
         B, S, D = flow.shape
-        assert(D==2)
+        assert(D==2) 
         flow_sincos = utils.misc.posemb_sincos_2d_xy(flow, self.latent_dim, cat_coords=True)
-        x = torch.cat([fcorr, flow_sincos], dim=2) # B,S,-1
+        x = torch.cat([fcorr, flow_sincos], dim=2) # B,S,-1 
         
         # conv1d wants channels in the middle
         out = x.permute(0,2,1)
-        out = self.first_block_conv(out)
+        out = self.first_block_conv(out) 
         out = self.first_block_relu(out)
         for i_block in range(self.n_block):
             net = self.basicblock_list[i_block]
@@ -354,10 +361,11 @@ def coords_grid(batch, ht, wd):
     coords = torch.stack(coords[::-1], dim=0).float()
     return coords[None].repeat(batch, 1, 1, 1)
 
+#Pre-computed feature map correlation wrapper => Computed over all timestamps
 class CorrBlock:
     def __init__(self, fmaps, num_levels=4, radius=4):
         B, S, C, H, W = fmaps.shape
-        self.S, self.C, self.H, self.W = S, C, H, W
+        self.B, self.S, self.C, self.H, self.W = B, S, C, H, W
         self.num_levels = num_levels
         self.radius = radius
         self.fmaps_pyramid = []
@@ -391,27 +399,40 @@ class CorrBlock:
             delta_lvl = delta.view(1, 2*r+1, 2*r+1, 2)
             coords_lvl = centroid_lvl + delta_lvl
 
-            corrs = bilinear_sampler(corrs.reshape(B*S*N, 1, H, W), coords_lvl)
+            try:
+                corrs = bilinear_sampler(corrs.reshape(B*S*N, 1, H, W), coords_lvl)
+            except:
+                print(B, S, N, B*S*N)
             corrs = corrs.view(B, S, N, -1)
             out_pyramid.append(corrs)
 
         out = torch.cat(out_pyramid, dim=-1) # B,S,N,LRR*2
         return out.contiguous().float()
 
-    def corr(self, targets):
-        B, S, N, C = targets.shape
+    def corr(self, targets): #Updates corrs_pyramid which is leveraged in sample() => targets are kpt_feat 
+        _, _, N, C = targets.shape
         assert(C==self.C)
         self.corrs_pyramid = []
-        for fmaps in self.fmaps_pyramid:
+
+        #Compute visual similarity maps in spatial pyramid 
+        for index, fmaps in enumerate(self.fmaps_pyramid): #Compute similarity
             _, _, _, H, W = fmaps.shape
-            fmap2s = fmaps.view(B, S, C, H*W)
-            corrs = torch.matmul(targets, fmap2s)
-            corrs = corrs.view(B, S, N, H, W) 
+            try:
+                fmap2s = fmaps.view(self.B, self.S, C, H*W) #Line in question - inspect fmaps shape 
+            except:
+                breakpoint() 
+            corrs = torch.matmul(targets, fmap2s) #(1, 1, 21, 128) X (1, 30, 128, 3072)
+            corrs = corrs.view(self.B, self.S, N, H, W) #(1, 30, 21, H, W) 
             corrs = corrs / torch.sqrt(torch.tensor(C).float())
-            self.corrs_pyramid.append(corrs)
+            if index == 0:
+                init_coords = torch.argmax(corrs.view(corrs.shape[0], corrs.shape[1], corrs.shape[2], -1), dim=-1) #(1, 30, 21, 1) - linear index 
+                init_coords = torch.stack([init_coords // W, init_coords % W], -1) #(1, 30, 21, 2) 
+            self.corrs_pyramid.append(corrs) 
+        
+        return init_coords 
 
 class Pips(nn.Module):
-    def __init__(self, stride=8):
+    def __init__(self, stride=8, learn_kpts=False, init_std=0.1, batch_size=1, seq_len=30, num_kpts=21, channels=128):
         super(Pips, self).__init__()
 
         self.stride = stride
@@ -425,90 +446,67 @@ class Pips(nn.Module):
         self.delta_block = DeltaBlock(hidden_dim=self.hidden_dim, corr_levels=self.corr_levels, corr_radius=self.corr_radius)
         self.norm = nn.GroupNorm(1, self.latent_dim)
 
-    def forward(self, trajs_e0, rgbs, iters=3, trajs_g=None, vis_g=None, valids=None, sw=None, feat_init=None, is_train=False, delta_mult=0.5):
-        total_loss = torch.tensor(0.0).cuda()
+        if learn_kpts: #(B, S, N, C) => (batch_size, seq_len, kpts, channels)
+            self.kptFeatOne = nn.Parameter(torch.randn(1, 1, num_kpts, channels) * init_std, requires_grad=True) #Want dims to be [num_kpts, channel] => Want the same feature vector for each key point across all frames
+        else:
+            self.kptFeatOne = None
 
-        B,S,N,D = trajs_e0.shape
-        assert(D==2)
-
+    def forward(self, rgbs, iters=3, trajs_g=None, vis_g=None, valids=None, sw=None, feat_init=None, is_train=False, delta_mult=0.5):
         B,S,C,H,W = rgbs.shape
         rgbs = 2 * (rgbs / 255.0) - 1.0
         
         H8 = H//self.stride
         W8 = W//self.stride
 
-        device = rgbs.device
-
         rgbs_ = rgbs.reshape(B*S, C, H, W)
-        fmaps_ = self.fnet(rgbs_)
-        fmaps = fmaps_.reshape(B, S, self.latent_dim, H8, W8)
+        fmaps_ = self.fnet(rgbs_) #Encode features 
+        fmaps = fmaps_.reshape(B, S, self.latent_dim, H8, W8) #Reshapes to include batch dimensions 
 
         if sw is not None and sw.save_this:
             sw.summ_feats('1_model/0_fmaps', fmaps.unbind(1))
 
-        coords = trajs_e0.clone()/float(self.stride)
-
-        hdim = self.hidden_dim
-
+        #Correlation between feature maps and precomputed features 
         fcorr_fn1 = CorrBlock(fmaps, num_levels=self.corr_levels, radius=self.corr_radius)
-        fcorr_fn2 = CorrBlock(fmaps, num_levels=self.corr_levels, radius=self.corr_radius)
-        fcorr_fn4 = CorrBlock(fmaps, num_levels=self.corr_levels, radius=self.corr_radius)
-        if feat_init is not None:
-            feats1, feats2, feats4 = feat_init
+
+        if self.kptFeatOne is not None:
+            feats1 = self.kptFeatOne 
         else:
             feat1 = utils.samp.bilinear_sample2d(fmaps[:,0], coords[:,0,:,0], coords[:,0,:,1]).permute(0, 2, 1) # B,N,C
             feats1 = feat1.unsqueeze(1).repeat(1, S, 1, 1) # B,S,N,C
             feats2 = feat1.unsqueeze(1).repeat(1, S, 1, 1) # B,S,N,C
             feats4 = feat1.unsqueeze(1).repeat(1, S, 1, 1) # B,S,N,C
         
+        coord_predictions1 = [] # for loss
+        coord_predictions2 = [] # for vis
+
+        #Section 3.4 => Run correlation between kpt_feats and cnn_feature_maps  
+        coords = fcorr_fn1.corr(feats1)  
+        B,S,N,D = coords.shape 
+        if not S == 30:
+            breakpoint() 
+        assert S == 30 
+        assert D == 2 
+
         coords_bak = coords.clone()
 
         if not is_train:
             coords[:,0] = coords_bak[:,0] # lock coord0 for target
-        
-        coord_predictions1 = [] # for loss
-        coord_predictions2 = [] # for vis
 
-        fcorr_fn1.corr(feats1) # we only need to run this corr once
-        
+        #Section 3.5 => Iterative updates via optimization process 
         for itr in range(iters):
             coords = coords.detach()
             coord_predictions2.append(coords.detach() * self.stride)
 
-            if itr >= 1:
-                # timestep indices
-                inds2 = (torch.arange(S)-2).clip(min=0)
-                inds4 = (torch.arange(S)-4).clip(min=0)
-                # coordinates at these timesteps
-                coords2_ = coords[:,inds2].reshape(B*S,N,2)
-                coords4_ = coords[:,inds4].reshape(B*S,N,2)
-                # featuremaps at these timesteps
-                fmaps2_ = fmaps[:,inds2].reshape(B*S,self.latent_dim,H8,W8)
-                fmaps4_ = fmaps[:,inds4].reshape(B*S,self.latent_dim,H8,W8)
-                # features at these coords/times
-                feats2_ = utils.samp.bilinear_sample2d(fmaps2_, coords2_[:,:,0], coords2_[:,:,1]).permute(0, 2, 1) # B*S, N, C
-                feats2 = feats2_.reshape(B,S,N,self.latent_dim)
-                feats4_ = utils.samp.bilinear_sample2d(fmaps4_, coords4_[:,:,0], coords4_[:,:,1]).permute(0, 2, 1) # B*S, N, C
-                feats4 = feats4_.reshape(B,S,N,self.latent_dim)
-
-            fcorr_fn2.corr(feats2)
-            fcorr_fn4.corr(feats4)
-
             # now we want costs at the current locations
-            fcorrs1 = fcorr_fn1.sample(coords) # B,S,N,LRR
-            fcorrs2 = fcorr_fn2.sample(coords) # B,S,N,LRR
-            fcorrs4 = fcorr_fn4.sample(coords) # B,S,N,LRR
-            LRR = fcorrs1.shape[3]
+            fcorrs1 = fcorr_fn1.sample(coords) # B,S,N,LRR (196) 
+            LRR = fcorrs1.shape[3] 
 
             # we want everything in the format B*N, S, C
             fcorrs1_ = fcorrs1.permute(0, 2, 1, 3).reshape(B*N, S, LRR)
-            fcorrs2_ = fcorrs2.permute(0, 2, 1, 3).reshape(B*N, S, LRR)
-            fcorrs4_ = fcorrs4.permute(0, 2, 1, 3).reshape(B*N, S, LRR)
-            fcorrs_ = torch.cat([fcorrs1_, fcorrs2_, fcorrs4_], dim=2)
             flows_ = (coords[:,1:] - coords[:,:-1]).permute(0,2,1,3).reshape(B*N, S-1, 2)
             flows_ = torch.cat([flows_, flows_[:,-1:]], dim=1) # B*N,S,2
 
-            delta_coords_ = self.delta_block(fcorrs_, flows_) # B*N,S,2
+            delta_coords_ = self.delta_block(fcorrs1_, flows_) # B*N,S,2
 
             if not is_train and itr >= iters*3/4:
                 delta_coords_ = delta_coords_ * delta_mult
@@ -523,12 +521,11 @@ class Pips(nn.Module):
 
         # pause at the end, to make the summs more interpretable
         coord_predictions2.append(coords * self.stride)
-        coord_predictions2.append(coords * self.stride)
 
         if trajs_g is not None:
             loss = sequence_loss(coord_predictions1, trajs_g, vis_g, valids, 0.8)
         else:
             loss = None
             
-        feats = (feats1, feats2, feats4)
+        feats = (feats1)
         return coord_predictions1, coord_predictions2, feats, loss
