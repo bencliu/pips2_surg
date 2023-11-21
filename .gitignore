@@ -9,3 +9,8 @@ logs_train/
 logs_demo/
 checkpoints/
 logs_export_mp4_dataset/
+pod_export/
+reference_model/
+stock_videos/
+temp_36_A_em00_ae_160835/
+temp_36_A_em00_ae_170230
