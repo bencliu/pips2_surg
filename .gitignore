@@ -8,3 +8,4 @@
 logs_train/
 logs_demo/
 checkpoints/
+logs_export_mp4_dataset/
