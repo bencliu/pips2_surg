@@ -211,6 +211,7 @@ def analyze_dataset():
             processed_annot = [] #For all frames 
             for i, frame_annot in enumerate(sub_annot): #Each frame annotation item 
                 frame_final_annot = process_frame_annot_helper(frame_annot, valids[i], (orig_height, orig_width))
+                breakpoint()  #TODOO
                 processed_annot.append(frame_final_annot)
             processed_annot_npz = np.array(processed_annot)
 
@@ -246,3 +247,6 @@ def sanity_check(annot, img, index):
     plt.axis('off')
     plt.savefig(debug_save_path, bbox_inches='tight', pad_inches=0)
     plt.close()
+
+if __name__ == "__main__":
+    analyze_dataset() 

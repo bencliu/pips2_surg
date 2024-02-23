@@ -160,7 +160,7 @@ def run_model(model, d, device, iters=8, sw=None, is_train=True, use_augs=True):
     B, S, N, D = trajs_g.shape
     assert(D==2)
     
-    preds, preds_anim, _, loss = model(rgbs, iters=iters, trajs_g=trajs_g, vis_g=vis_g, valids=valids)
+    preds, preds_anim, _, loss = model(rgbs, iters=iters, trajs_g=trajs_g, vis_g=vis_g, valids=valids) #TODO
     trajs_e = preds[-1] #NOTE: Everything with trajs_e from this point on refers to pred 
 
     total_loss += loss
@@ -215,6 +215,8 @@ def run_model(model, d, device, iters=8, sw=None, is_train=True, use_augs=True):
         prep_grays = torch.mean(prep_rgbs, dim=2, keepdim=True).repeat(1, 1, 3, 1, 1)
 
         rgb0 = sw.summ_traj2ds_on_rgb('', trajs_g[0:1], prep_rgbs[0:1,0], valids=valids[0:1], cmap='winter', linewidth=2, only_return=True)
+
+        #Add in threshold maps 
         sw.summ_traj2ds_on_rgb('2_outputs_train/trajs_e_on_rgb0', trajs_e[0:1], utils.improc.preprocess_color(rgb0), valids=valids[0:1], cmap='spring', linewidth=2, frame_id=ate_all[0].mean().item())
         sw.summ_traj2ds_on_rgbs2('0_inputs_train/trajs_g_on_rgbs2', trajs_g[0:1,::4], vis_g[0:1,::4], prep_rgbs[0:1,::4], valids=valids[0:1,::4], frame_ids=list(range(0,S,4)))
         
@@ -234,6 +236,7 @@ def run_model(model, d, device, iters=8, sw=None, is_train=True, use_augs=True):
             rgb_vis.append(sw.summ_traj2ds_on_rgb('', tre[0:1], gt_rgb, valids=valids[0:1], only_return=True, cmap='spring', frame_id=ate_all[0]))
         sw.summ_rgbs('3_train/animated_trajs_on_rgb', rgb_vis)
 
+        #Train Inputs 
         outs = sw.summ_pts_on_rgbs(
             '',
             trajs_g_clamp[0:1,::4],
@@ -247,6 +250,7 @@ def run_model(model, d, device, iters=8, sw=None, is_train=True, use_augs=True):
             valids=valids[0:1,::4]*vis_g[0:1,::4], 
             cmap='spring', linewidth=2)
 
+        #Train Outputs 
         outs = sw.summ_pts_on_rgbs(
             '',
             trajs_g_clamp[0:1,::4],
@@ -259,6 +263,8 @@ def run_model(model, d, device, iters=8, sw=None, is_train=True, use_augs=True):
             utils.improc.preprocess_color(outs),
             valids=valids[0:1,::4],
             cmap='spring', linewidth=2)
+
+        #TODO - save renderings of videos 
     metrics = {'train_' + key: value for key, value in metrics.items()}
         
     return total_loss, metrics
@@ -274,7 +280,8 @@ def main(
         shuffle=True, # dataset shuffling
         cache_len=0, # how many samples to cache into ram (for overfitting/debug)
         cache_freq=0, # how often to add a new sample to cache
-        dataset_location="/pasteur/u/bencliu/open_surg/data/surgical_hands_release/train_dataset3", # where we export the dataset
+        train_dataset_location="/pasteur/u/bencliu/open_surg/data/surgical_hands_release/train_dataset3", # where we export the dataset
+        val_dataset_location="/pasteur/u/bencliu/open_surg/data/surgical_hands_release/val_dataset",
         dataset_version='ae_36_128_384x512', # export version
         n_pool=1000, # size of running avg for stats
         quick=False, # debug
@@ -285,7 +292,7 @@ def main(
         use_scheduler=True,
         max_iters=201000, 
         # summaries
-        log_dir='./logs_train',
+        log_dir='/pasteur/u/bencliu/open_surg/results/trial_2_11',
         log_freq=1000,
         val_freq=100, #100
         # saving/loading
@@ -297,8 +304,12 @@ def main(
         load_step=False,
         ignore_load="Test",
         device_ids=[0],
-        exp_name="debug_surg_f1_minor_freeze", 
+        exp_name="debug_surg_f1_argmax_test2_corrviz", 
         finetune_f1=True, 
+        params_frozen=False,
+        num_train_videos=1,
+        num_val_videos=1, 
+        validate_unseen=False, 
 ):
     device = 'cuda:%d' % device_ids[0]
 
@@ -364,13 +375,15 @@ def main(
 
     def worker_init_fn(worker_id):
         np.random.seed(np.random.get_state()[1][0] + worker_id)
+
+    #Training Dataset and Loader 
     dataset_t = ExportDataset(
-        dataset_location=dataset_location,
+        dataset_location=train_dataset_location,
         dataset_version=dataset_version,
         S=S,
         crop_size=crop_size,
         use_augs=use_augs,
-        sample=1) #TODO change sampling 
+        sample=num_train_videos) #Number of videos chosen in the training dataset 
 
     dataloader_t = DataLoader(
         dataset_t,
@@ -381,6 +394,27 @@ def main(
         drop_last=True)
     
     iterloader_t = iter(dataloader_t)
+
+    #Validation dataset and loader  
+    if not validate_unseen: 
+        val_dataset_location = train_dataset_location
+    dataset_v = ExportDataset(
+        dataset_location=val_dataset_location,
+        dataset_version=dataset_version,
+        S=S,
+        crop_size=crop_size,
+        use_augs=use_augs,
+        sample=num_val_videos) #Number of videos chosen in the training dataset 
+
+    dataloader_v = DataLoader(
+        dataset_v,
+        batch_size=B,
+        shuffle=shuffle,
+        num_workers=2,
+        worker_init_fn=worker_init_fn,
+        drop_last=True)
+    
+    iterloader_v = iter(dataloader_v)
 
     if cache_len:
         sample_pool_t = utils.misc.SimplePool(cache_len, version='np')
@@ -410,8 +444,7 @@ def main(
 
     print("Finished loading model") 
     
-    #requires_grad(parameters, True) 
-    if finetune_f1:
+    if params_frozen:
         for name, param in model.named_parameters():
             if "kptFeat" in name:
                 print("Maintained unfrozen param: ", name) 
@@ -420,6 +453,7 @@ def main(
                 param.requires_grad = False
     else:
         requires_grad(parameters, True) 
+
     model.train() 
 
     pools_t = create_pools(n_pool)
@@ -483,7 +517,7 @@ def main(
                 total_loss.backward()
             sw_t.summ_scalar('total_loss', metrics['train_total_loss'])
 
-            #HERE logging 
+            #TODO - logging schemes 
             for key in list(pools_t.keys()):
                 if key in metrics:
                     pools_t[key].update([metrics[key]])
@@ -514,14 +548,11 @@ def main(
                 scalar_freq=log_freq//1, #4
                 just_gif=True,
                 val=True)
-            if cache_len:
-                sample = sample_pool_t.sample()
-            else:
-                try:
-                    sample = next(iterloader_t)
-                except StopIteration:
-                    iterloader_t = iter(dataloader_t)
-                    sample = next(iterloader_t)
+            try:
+                sample = next(iterloader_v)
+            except StopIteration:
+                iterloader_v = iter(dataloader_v)
+                sample = next(iterloader_v)
             with torch.no_grad():
                 metrics = val_model(
                     model, sample, device,

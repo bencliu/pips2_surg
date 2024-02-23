@@ -363,27 +363,26 @@ def coords_grid(batch, ht, wd):
 
 #Pre-computed feature map correlation wrapper => Computed over all timestamps
 class CorrBlock:
-    def __init__(self, fmaps, num_levels=4, radius=4):
+    def __init__(self, fmaps, orig_height, orig_width, num_levels=4, radius=4): #TODO Update
         B, S, C, H, W = fmaps.shape
         self.B, self.S, self.C, self.H, self.W = B, S, C, H, W
         self.num_levels = num_levels
         self.radius = radius
         self.fmaps_pyramid = []
         self.fmaps_pyramid.append(fmaps)
+        self.orig_height = orig_height 
+        self.orig_width = orig_width  
         for i in range(self.num_levels-1):
             fmaps_ = fmaps.reshape(B*S, C, H, W)
             fmaps_ = F.avg_pool2d(fmaps_, 2, stride=2)
             _, _, H, W = fmaps_.shape
-            fmaps = fmaps_.reshape(B, S, C, H, W)
+            fmaps = fmaps_.reshape(B, S, C, H, W) 
             self.fmaps_pyramid.append(fmaps)
 
     def sample(self, coords):
         r = self.radius
-        B, S, N, D = coords.shape
+        B, S, N, D = coords.shape #(1, 30 seq_len, 21 kp, 2 (xy))
         assert(D==2)
-
-        x0 = coords[:,0,:,0].round().clamp(0, self.W-1).long()
-        y0 = coords[:,0,:,1].round().clamp(0, self.H-1).long()
 
         H, W = self.H, self.W
         out_pyramid = []
@@ -395,7 +394,8 @@ class CorrBlock:
             dy = torch.linspace(-r, r, 2*r+1)
             delta = torch.stack(torch.meshgrid(dy, dx, indexing='ij'), axis=-1).to(coords.device) 
 
-            centroid_lvl = coords.reshape(B*S*N, 1, 1, 2) / 2**i
+            #TODO - Map sampled coordinaes to feature level 
+            centroid_lvl = coords.reshape(B*S*N, 1, 1, 2) / 2**i #TODO - important: this operation here ensures that the sampled coordinates are mapped to the feature maps properly 
             delta_lvl = delta.view(1, 2*r+1, 2*r+1, 2)
             coords_lvl = centroid_lvl + delta_lvl
 
@@ -419,14 +419,15 @@ class CorrBlock:
             _, _, _, H, W = fmaps.shape
             try:
                 fmap2s = fmaps.view(self.B, self.S, C, H*W) #Line in question - inspect fmaps shape 
-            except:
+            except: 
                 breakpoint() 
             corrs = torch.matmul(targets, fmap2s) #(1, 1, 21, 128) X (1, 30, 128, 3072)
-            corrs = corrs.view(self.B, self.S, N, H, W) #(1, 30, 21, H, W) 
+            corrs = corrs.view(self.B, self.S, N, H, W) #(1, 30, 21, H, W) -- 1 similarity 2D map for each keypoint on each frame
             corrs = corrs / torch.sqrt(torch.tensor(C).float())
             if index == 0:
-                init_coords = torch.argmax(corrs.view(corrs.shape[0], corrs.shape[1], corrs.shape[2], -1), dim=-1) #(1, 30, 21, 1) - linear index 
-                init_coords = torch.stack([init_coords // W, init_coords % W], -1) #(1, 30, 21, 2) 
+                #Perform argmax operation for each keypoint matrix for each sequence
+                init_coords = torch.argmax(corrs.view(corrs.shape[0], corrs.shape[1], corrs.shape[2], -1), dim=-1) #(1, 30, 21, 1) - linear index
+                init_coords = torch.stack([init_coords // W, init_coords % W], -1) #(1, 30, 21, 2) [.., .. Row (H), Col (W)]
             self.corrs_pyramid.append(corrs) 
         
         return init_coords 
@@ -466,13 +467,13 @@ class Pips(nn.Module):
             sw.summ_feats('1_model/0_fmaps', fmaps.unbind(1))
 
         #Correlation between feature maps and precomputed features 
-        fcorr_fn1 = CorrBlock(fmaps, num_levels=self.corr_levels, radius=self.corr_radius)
+        fcorr_fn1 = CorrBlock(fmaps, num_levels=self.corr_levels, radius=self.corr_radius, orig_height=H, orig_width=W)
 
         if self.kptFeatOne is not None:
             feats1 = self.kptFeatOne 
         else:
             feat1 = utils.samp.bilinear_sample2d(fmaps[:,0], coords[:,0,:,0], coords[:,0,:,1]).permute(0, 2, 1) # B,N,C
-            feats1 = feat1.unsqueeze(1).repeat(1, S, 1, 1) # B,S,N,C
+            feats1 = feat1.unsqueeze(1).repeat(1, S, 1, 1) # B,S,N,C -- (1, 30 seq_len, 21 kp, 2 (xy))
             feats2 = feat1.unsqueeze(1).repeat(1, S, 1, 1) # B,S,N,C
             feats4 = feat1.unsqueeze(1).repeat(1, S, 1, 1) # B,S,N,C
         
@@ -498,20 +499,21 @@ class Pips(nn.Module):
             coord_predictions2.append(coords.detach() * self.stride)
 
             # now we want costs at the current locations
-            fcorrs1 = fcorr_fn1.sample(coords) # B,S,N,LRR (196) 
+            fcorrs1 = fcorr_fn1.sample(coords) # B,S,N,LRR (196) ] => C_k in paper 
             LRR = fcorrs1.shape[3] 
 
             # we want everything in the format B*N, S, C
             fcorrs1_ = fcorrs1.permute(0, 2, 1, 3).reshape(B*N, S, LRR)
-            flows_ = (coords[:,1:] - coords[:,:-1]).permute(0,2,1,3).reshape(B*N, S-1, 2)
+            flows_ = (coords[:,1:] - coords[:,:-1]).permute(0,2,1,3).reshape(B*N, S-1, 2) # => X_k in paper 
             flows_ = torch.cat([flows_, flows_[:,-1:]], dim=1) # B*N,S,2
 
-            delta_coords_ = self.delta_block(fcorrs1_, flows_) # B*N,S,2
+            #Mixer model output 
+            delta_coords_ = self.delta_block(fcorrs1_, flows_) # B*N,S,2 -- (1 * 21 kp, 30 seq_len, xy)
 
             if not is_train and itr >= iters*3/4:
                 delta_coords_ = delta_coords_ * delta_mult
 
-            coords = coords + delta_coords_.reshape(B, N, S, 2).permute(0,2,1,3)
+            coords = coords + delta_coords_.reshape(B, N, S, 2).permute(0,2,1,3) #Update coordinates 
 
             if not is_train:
                 coords[:,0] = coords_bak[:,0] # lock coord0 for target
